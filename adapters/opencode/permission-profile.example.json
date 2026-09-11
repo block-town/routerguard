@@ -1,0 +1,107 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "_comment": "Two halves. The global `permission` block is for interactive sessions: read-only commands allowed, secret containers denied, everything else asks. The `worker` agent is an unattended batch worker with an enumerated allowlist; launch it with `opencode run --agent worker` and never with --auto. opencode matches permission globs last-match-wins, so denies come after allows. `echo *` must stay allowed for a guard `on_block: rewrite` to land as a harmless tool result.",
+  "permission": {
+    "edit": "ask",
+    "webfetch": "ask",
+    "bash": {
+      "*": "ask",
+      "ls *": "allow",
+      "pwd": "allow",
+      "git status": "allow",
+      "git diff *": "allow",
+      "git log *": "allow",
+      "grep *": "allow",
+      "rg *": "allow",
+      "head *": "allow",
+      "tail *": "allow",
+      "wc *": "allow",
+      "echo *": "allow",
+      "rm *": "deny",
+      "sudo *": "deny",
+      "* .env": "deny",
+      "* .env.*": "deny",
+      "* ./.env*": "deny",
+      "* */.env": "deny",
+      "* */.env.*": "deny",
+      "* *.env.example": "allow",
+      "* ~/.*": "deny",
+      "* $HOME/.*": "deny",
+      "* --pre *": "deny",
+      "git diff --no-index *": "deny",
+      "*security find-generic-password*": "deny",
+      "*security find-internet-password*": "deny",
+      "*security dump-keychain*": "deny"
+    },
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow",
+      "*/.ssh/*": "deny",
+      "*/.aws/*": "deny",
+      "*tokens.json": "deny",
+      "*credentials.json": "deny",
+      "*/opencode/auth.json": "deny",
+      "*/.claude/settings.local.json": "deny"
+    },
+    "external_directory": "ask"
+  },
+  "agent": {
+    "worker": {
+      "mode": "subagent",
+      "model": "litellm/auto",
+      "description": "Unattended batch worker: takes one item from a queue, writes its output under batches/, runs the checker, returns. Its permission profile replaces --auto: three project scripts, reads and writes inside batches/ only, no web, no directories outside the project.",
+      "tools": {
+        "read": true,
+        "write": true,
+        "edit": true,
+        "bash": true,
+        "grep": true,
+        "glob": true
+      },
+      "permission": {
+        "bash": {
+          "*": "deny",
+          "pwd": "allow",
+          "echo *": "allow",
+          "head *": "allow",
+          "wc *": "allow",
+          "sort *": "allow",
+          "uniq *": "allow",
+          "python3 scripts/queue.py *": "allow",
+          "python3 scripts/check.py *": "allow",
+          "node scripts/lint.mjs *": "allow",
+          "ls batches*": "allow",
+          "cat batches/*": "allow",
+          "grep *batches/*": "allow",
+          "rg *batches/*": "allow",
+          "* .env": "deny",
+          "* .env.*": "deny",
+          "* */.env": "deny",
+          "* */.env.*": "deny",
+          "* ~/.*": "deny",
+          "* $HOME/.*": "deny",
+          "* --pre *": "deny",
+          "*security find-*": "deny"
+        },
+        "edit": {
+          "*": "deny",
+          "batches/**": "allow",
+          "batches/**/*.py": "deny",
+          "batches/**/*.sh": "deny",
+          "batches/**/*.js": "deny",
+          "batches/**/*.mjs": "deny"
+        },
+        "read": {
+          "*": "deny",
+          "batches/**": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "external_directory": "deny",
+        "task": "deny"
+      }
+    }
+  }
+}

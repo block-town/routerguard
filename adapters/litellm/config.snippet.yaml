@@ -1,0 +1,14 @@
+# Add to your LiteLLM proxy config (litellm --config config.yaml).
+# The `guard` package must be importable by the proxy process:
+#   export PYTHONPATH=/path/to/routerguard:$PYTHONPATH
+# and the rules file is <repo>/rules.yaml, <repo>/rules.example.yaml, or LLM_GUARD_RULES.
+
+litellm_settings:
+  callbacks:
+    - guard.hooks.guard_instance     # mask secrets outbound, gate tool calls inbound, ledger both
+
+# Optional: environment for the proxy process
+#   LLM_GUARD_SECRET_FILES=~/.env:~/work/app/.env   # KEY=value files whose values get masked
+#   LLM_GUARD_DB=~/.local/share/routerguard/ledger.db
+#   LLM_GUARD_MODE=flag                             # dry run: verdicts logged, nothing blocked
+#   LLM_GUARD=off                                   # no-op

@@ -1,0 +1,12 @@
+rules.yaml
+*.db
+*.db-wal
+*.db-shm
+.test-secrets.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
